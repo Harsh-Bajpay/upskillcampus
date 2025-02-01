@@ -1,226 +1,206 @@
-import kagglehub
+import streamlit as st
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-import streamlit as st
-import seaborn as sns
-import matplotlib.pyplot as plt
+import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-class CropProductionPredictor:
-    def __init__(self):
-        self.model = None
-        self.scaler = StandardScaler()
-        self.features = ['State_Name', 'District_Name', 'Crop_Year', 'Season', 
-                        'Crop', 'Area', 'Production']
-        
-    def load_and_preprocess_data(self):
-        """Load and preprocess the agricultural dataset from Kaggle"""
-        try:
-            # Download dataset from Kaggle
-            dataset_path = kagglehub.dataset_download("pyatakov/india-agriculture-crop-production")
-            
-            # Load the CSV file
-            df = pd.read_csv(f"{dataset_path}/india_crop_production.csv")
-            
-            # Basic preprocessing
-            df = df.rename(columns={
-                'State_Name': 'State',
-                'District_Name': 'District',
-                'Crop_Year': 'Year'
-            })
-            
-            # Handle missing values
-            df = df.dropna()
-            
-            # Feature engineering
-            df['Yield'] = df['Production'] / df['Area']
-            df['Year'] = df['Year'].astype(int)
-            
-            return df
-            
-        except Exception as e:
-            print(f"Error loading dataset: {e}")
-            return None
+# Set page config
+st.set_page_config(
+    page_title="India Agriculture Crop Production Predictor",
+    page_icon="🌾",
+    layout="wide"
+)
 
-    def prepare_features(self, df):
-        """Prepare features for model training"""
-        # Create dummy variables for categorical columns
-        categorical_cols = ['State', 'District', 'Season', 'Crop']
-        df_encoded = pd.get_dummies(df, columns=categorical_cols)
-        
-        # Select features for model
-        X = df_encoded.drop(['Production', 'Yield'], axis=1)
-        y = df_encoded['Production']
-        
-        return X, y
+@st.cache_data
+def load_and_preprocess_data():
+    """Load and preprocess the dataset"""
+    # Load data
+    df = pd.read_csv('India Agriculture Crop Production.csv')
+    
+    # Preprocessing steps
+    df['Year'] = df['Year'].str[:4].astype(int)
+    df = df.dropna()
+    df = df.drop('Area Units', axis=1)
+    
+    # Convert production units
+    df.loc[df['Crop'] == 'Cotton(lint)','Production'] = (df.loc[df['Crop'] == 'Cotton(lint)','Production']*170)/1000
+    df.loc[df['Crop'] == 'Jute','Production'] = (df.loc[df['Crop'] == 'Jute','Production']*180)/1000
+    df.loc[df['Crop'] == 'Mesta','Production'] = (df.loc[df['Crop'] == 'Mesta','Production']*180)/1000
+    df.loc[df['Crop'] == 'Coconut','Production'] = (df.loc[df['Crop'] == 'Coconut','Production']*1.5)/1000
+    
+    df = df.drop(['Production Units', 'Yield'], axis=1)
+    df['Yield'] = df['Production'] / df['Area']
+    
+    return df
 
-    def train_model(self, X_train, y_train):
-        """Train the crop production prediction model"""
-        # Random Forest model
-        rf_model = RandomForestRegressor(
-            n_estimators=100,
-            max_depth=15,
-            random_state=42
-        )
-        rf_model.fit(X_train, y_train)
-        self.model = rf_model
+@st.cache_resource
+def train_model(df):
+    """Train the LightGBM model"""
+    # Feature preprocessing
+    df['Area'] = np.log1p(df['Area'])
+    df['Production'] = np.log1p(df['Production'])
+    
+    # Handle rare categories
+    columns = ['District', 'Crop']
+    labels = {'District': 'diğer1', 'Crop': 'diğer2'}
+    for i in columns:
+        alt_frekans_degeri = df[i].value_counts().quantile(0.05)
+        frekanslar = df[i].value_counts()
+        nadir_kategorikler = frekanslar[frekanslar < alt_frekans_degeri].index
+        df[i] = df[i].replace(nadir_kategorikler, labels[i])
+    
+    # Remove outliers and prepare features
+    df = df.drop(['State', 'Year', 'Yield'], axis=1)
+    df = pd.get_dummies(df, columns=['District', 'Season', 'Crop'], drop_first=True)
+    
+    # Split features and target
+    X = df.drop('Production', axis=1)
+    y = df['Production']
+    
+    # Train test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, train_size=0.8, random_state=17)
+    
+    # Train model
+    model = lgb.LGBMRegressor(
+        boosting_type='gbdt',
+        num_leaves=40,
+        learning_rate=0.17,
+        n_estimators=30,
+        max_depth=30,
+        random_state=33
+    )
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='l2')
+    
+    return model
 
-class StreamlitApp:
-    def __init__(self):
-        self.predictor = CropProductionPredictor()
+def predict_production(model, district, season, area, crop=None):
+    """Make prediction for single crop or all crops"""
+    area = np.log1p(area)
+    
+    if crop:
+        # Single crop prediction
+        input_data = pd.DataFrame({
+            'District': [district],
+            'Season': [season],
+            'Area': [area]
+        })
         
-    def run(self):
-        st.title("India Agriculture Crop Production Prediction System")
+        input_data = pd.get_dummies(input_data, columns=['District', 'Season'], drop_first=True)
+        model_features = model.booster_.feature_name()
         
-        try:
-            # Load data
-            data = self.predictor.load_and_preprocess_data()
-            if data is None:
-                st.error("Failed to load dataset. Please check your internet connection and try again.")
-                return
+        missing_cols = list(set(model_features) - set(input_data.columns))
+        missing_data = pd.DataFrame(0, index=input_data.index, columns=missing_cols)
+        input_data = pd.concat([input_data, missing_data], axis=1)
+        
+        input_data = input_data[model_features]
+        
+        crops = [col for col in model_features if 'Crop_' in col]
+        for col in crops:
+            input_data[col] = 1 if col == f'Crop_{crop}' else 0
             
-            # Sidebar navigation
-            st.sidebar.title("Navigation")
-            page = st.sidebar.radio("Select Page", 
-                ["Overview", "Data Analysis", "Prediction", "Model Performance"])
+        prediction = model.predict(input_data)[0]
+        return np.exp(prediction) - 1
+    else:
+        # All crops prediction
+        input_data = pd.DataFrame({
+            'District': [district],
+            'Season': [season],
+            'Area': [area]
+        })
+        
+        input_data = pd.get_dummies(input_data, columns=['District', 'Season'], drop_first=True)
+        model_features = model.booster_.feature_name()
+        
+        missing_cols = list(set(model_features) - set(input_data.columns))
+        missing_data = pd.DataFrame(0, index=input_data.index, columns=missing_cols)
+        input_data = pd.concat([input_data, missing_data], axis=1)
+        
+        input_data = input_data[model_features]
+        
+        crops = [col for col in model_features if 'Crop_' in col]
+        results = {}
+        
+        for crop in crops:
+            input_data_crop = input_data.copy()
+            for col in crops:
+                input_data_crop[col] = 1 if col == crop else 0
+            prediction = model.predict(input_data_crop)
+            results[crop.replace('Crop_', '')] = np.exp(prediction[0]) - 1
             
-            if page == "Overview":
-                self.show_overview(data)
-            elif page == "Data Analysis":
-                self.show_analysis(data)
-            elif page == "Prediction":
-                self.show_prediction(data)
-            else:
-                self.show_model_performance(data)
-                
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-
-    def show_overview(self, data):
-        st.header("Dataset Overview")
-        
-        # Display basic statistics
-        st.subheader("Dataset Statistics")
-        st.write(data.describe())
-        
-        # Display unique values
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Unique States")
-            st.write(data['State'].nunique())
-            st.subheader("Unique Crops")
-            st.write(data['Crop'].nunique())
-        with col2:
-            st.subheader("Year Range")
-            st.write(f"{data['Year'].min()} - {data['Year'].max()}")
-            st.subheader("Total Districts")
-            st.write(data['District'].nunique())
-
-    def show_analysis(self, data):
-        st.header("Data Analysis")
-        
-        # Top producing states
-        st.subheader("Top 10 Producing States")
-        top_states = data.groupby('State')['Production'].sum().sort_values(ascending=False).head(10)
-        fig, ax = plt.subplots(figsize=(10, 6))
-        top_states.plot(kind='bar', ax=ax)
-        plt.xticks(rotation=45)
-        st.pyplot(fig)
-        
-        # Crop-wise production
-        st.subheader("Crop-wise Production")
-        crop_prod = data.groupby('Crop')['Production'].sum().sort_values(ascending=False).head(10)
-        fig, ax = plt.subplots(figsize=(10, 6))
-        crop_prod.plot(kind='bar', ax=ax)
-        plt.xticks(rotation=45)
-        st.pyplot(fig)
-        
-        # Yearly trend
-        st.subheader("Production Trend Over Years")
-        yearly_prod = data.groupby('Year')['Production'].sum()
-        fig, ax = plt.subplots(figsize=(10, 6))
-        yearly_prod.plot(kind='line', ax=ax)
-        st.pyplot(fig)
-
-    def show_prediction(self, data):
-        st.header("Crop Production Prediction")
-        
-        # Input form
-        state = st.selectbox("Select State", sorted(data['State'].unique()))
-        district = st.selectbox("Select District", 
-                              sorted(data[data['State'] == state]['District'].unique()))
-        crop = st.selectbox("Select Crop", sorted(data['Crop'].unique()))
-        season = st.selectbox("Select Season", sorted(data['Season'].unique()))
-        area = st.number_input("Area (in hectares)", min_value=0.0)
-        year = st.number_input("Year", min_value=2000, max_value=2030)
-        
-        if st.button("Predict"):
-            # Prepare input data
-            input_data = pd.DataFrame({
-                'State': [state],
-                'District': [district],
-                'Year': [year],
-                'Season': [season],
-                'Crop': [crop],
-                'Area': [area]
-            })
-            
-            # Make prediction
-            X, y = self.predictor.prepare_features(data)
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
-            self.predictor.train_model(X_train, y_train)
-            
-            # Transform input data
-            input_encoded = pd.get_dummies(input_data, columns=['State', 'District', 'Season', 'Crop'])
-            # Align input columns with training data
-            input_encoded = input_encoded.reindex(columns=X.columns, fill_value=0)
-            
-            prediction = self.predictor.model.predict(input_encoded)
-            st.success(f"Predicted Production: {prediction[0]:.2f} tonnes")
-
-    def show_model_performance(self, data):
-        st.header("Model Performance")
-        
-        # Prepare data
-        X, y = self.predictor.prepare_features(data)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
-        
-        # Train model
-        self.predictor.train_model(X_train, y_train)
-        
-        # Make predictions
-        y_pred = self.predictor.model.predict(X_test)
-        
-        # Calculate metrics
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        mae = mean_absolute_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
-        
-        # Display metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("RMSE", f"{rmse:.2f}")
-        with col2:
-            st.metric("MAE", f"{mae:.2f}")
-        with col3:
-            st.metric("R² Score", f"{r2:.2f}")
-        
-        # Plot actual vs predicted
-        fig, ax = plt.subplots(figsize=(10, 6))
-        plt.scatter(y_test, y_pred, alpha=0.5)
-        plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
-        plt.xlabel("Actual Production")
-        plt.ylabel("Predicted Production")
-        plt.title("Actual vs Predicted Production")
-        st.pyplot(fig)
+        return results
 
 def main():
-    app = StreamlitApp()
-    app.run()
+    st.title("🌾 India Agriculture Crop Production Predictor")
+    
+    # Load data and train model
+    with st.spinner("Loading data and training model..."):
+        df = load_and_preprocess_data()
+        model = train_model(df)
+    
+    # Sidebar
+    st.sidebar.header("Input Parameters")
+    
+    # Get unique values
+    districts = sorted(df['District'].unique())
+    seasons = sorted(df['Season'].unique())
+    crops = sorted(df['Crop'].unique())
+    
+    # Input fields
+    district = st.sidebar.selectbox("Select District", districts)
+    season = st.sidebar.selectbox("Select Season", seasons)
+    area = st.sidebar.number_input("Enter Area (hectares)", min_value=1, value=100)
+    
+    # Prediction type
+    pred_type = st.sidebar.radio("Prediction Type", ["Single Crop", "All Crops"])
+    
+    if pred_type == "Single Crop":
+        crop = st.sidebar.selectbox("Select Crop", crops)
+        if st.sidebar.button("Predict Production"):
+            prediction = predict_production(model, district, season, area, crop)
+            
+            st.success(f"Predicted production for {crop}: {prediction:.2f} tonnes")
+            
+            # Visualization
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.bar(['Predicted Production'], [prediction])
+            ax.set_ylabel('Production (tonnes)')
+            ax.set_title(f'Predicted Production for {crop}')
+            st.pyplot(fig)
+            
+    else:
+        if st.sidebar.button("Predict Production for All Crops"):
+            predictions = predict_production(model, district, season, area)
+            
+            # Display results
+            st.success("Production Predictions for All Crops")
+            
+            # Convert predictions to DataFrame for better display
+            pred_df = pd.DataFrame(predictions.items(), columns=['Crop', 'Predicted Production'])
+            pred_df = pred_df.sort_values('Predicted Production', ascending=False)
+            
+            # Display top 10 crops
+            st.subheader("Top 10 Crops by Predicted Production")
+            fig, ax = plt.subplots(figsize=(12, 6))
+            sns.barplot(data=pred_df.head(10), x='Predicted Production', y='Crop')
+            plt.title('Top 10 Crops by Predicted Production')
+            st.pyplot(fig)
+            
+            # Display full results in a table
+            st.subheader("All Predictions")
+            st.dataframe(pred_df)
+    
+    # Model performance metrics
+    st.sidebar.markdown("---")
+    if st.sidebar.checkbox("Show Model Performance"):
+        st.subheader("Model Performance Metrics")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Test Score", f"{model.best_score_['valid_0']['l2']:.4f}")
+        with col2:
+            st.metric("Number of Features", len(model.feature_name()))
 
 if __name__ == "__main__":
     main()
